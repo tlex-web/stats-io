@@ -103,87 +103,96 @@ mod windows_impl {
     use super::*;
     use std::time::Instant;
     
-    /// Get storage metrics on Windows using Performance Counters
+    /// Get storage metrics on Windows using WMI Performance Counters
+    /// 
+    /// Uses WMI to query Win32_PerfFormattedData_PerfDisk_PhysicalDisk for I/O metrics
+    /// without spawning any processes. Formatted counters are already in per-second format.
     pub async fn get_storage_metrics(
-        last_read_bytes: &Arc<Mutex<u64>>,
-        last_write_bytes: &Arc<Mutex<u64>>,
-        last_sample_time: &Arc<Mutex<Instant>>,
+        _last_read_bytes: &Arc<Mutex<u64>>,
+        _last_write_bytes: &Arc<Mutex<u64>>,
+        _last_sample_time: &Arc<Mutex<Instant>>,
     ) -> Result<StorageMetrics, MetricsError> {
-        // Use typeperf to query performance counters
-        // This is simpler than using PDH API directly
-        let output = tokio::process::Command::new("typeperf")
-            .args(&[
-                "\\PhysicalDisk(_Total)\\Disk Read Bytes/sec",
-                "\\PhysicalDisk(_Total)\\Disk Write Bytes/sec",
-                "\\PhysicalDisk(_Total)\\Avg. Disk Queue Length",
-                "-sc", "1",
-                "-si", "1",
-            ])
-            .output()
-            .await
-            .map_err(|e| MetricsError::CollectionFailed(format!("typeperf failed: {}", e)))?;
+        use wmi::WMIConnection;
         
-        if !output.status.success() {
-            // Fallback: return zero metrics if typeperf fails
-            return Ok(StorageMetrics {
-                read_throughput_mb_per_s: 0.0,
-                write_throughput_mb_per_s: 0.0,
-                queue_depth: None,
-                latency_ms: None,
-            });
+        // Use WMI COM interface directly - no process spawning, no windows
+        let wmi_con = WMIConnection::new()
+            .map_err(|e| MetricsError::CollectionFailed(format!("Failed to connect to WMI: {}", e)))?;
+        
+        // Query Win32_PerfFormattedData_PerfDisk_PhysicalDisk for _Total instance
+        // This provides formatted disk I/O counters (already in per-second format)
+        let query = "SELECT DiskReadBytesPerSec, DiskWriteBytesPerSec, CurrentDiskQueueLength FROM Win32_PerfFormattedData_PerfDisk_PhysicalDisk WHERE Name='_Total'";
+        let results: Result<Vec<serde_json::Value>, _> = wmi_con.raw_query(query);
+        
+        match results {
+            Ok(perf_data) => {
+                if let Some(disk_perf) = perf_data.first() {
+                    // Parse performance counters (already in per-second format)
+                    let read_bytes_per_sec = disk_perf.get("DiskReadBytesPerSec")
+                        .or_else(|| disk_perf.get("diskReadBytesPerSec"))
+                        .and_then(|v| {
+                            // Try as u64 first
+                            v.as_u64()
+                                .or_else(|| {
+                                    // Try as f64 (some WMI implementations return floats)
+                                    v.as_f64().map(|f| f as u64)
+                                })
+                                .or_else(|| {
+                                    // Try as string and parse
+                                    v.as_str().and_then(|s| s.parse::<u64>().ok())
+                                })
+                        })
+                        .unwrap_or(0);
+                    
+                    let write_bytes_per_sec = disk_perf.get("DiskWriteBytesPerSec")
+                        .or_else(|| disk_perf.get("diskWriteBytesPerSec"))
+                        .and_then(|v| {
+                            v.as_u64()
+                                .or_else(|| v.as_f64().map(|f| f as u64))
+                                .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
+                        })
+                        .unwrap_or(0);
+                    
+                    let queue_depth = disk_perf.get("CurrentDiskQueueLength")
+                        .or_else(|| disk_perf.get("currentDiskQueueLength"))
+                        .and_then(|v| {
+                            v.as_u64()
+                                .or_else(|| v.as_f64().map(|f| f as u64))
+                                .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
+                        })
+                        .map(|q| q as u32);
+                    
+                    // Convert bytes per second to MB per second
+                    let read_throughput_mb_per_s = read_bytes_per_sec as f64 / (1024.0 * 1024.0);
+                    let write_throughput_mb_per_s = write_bytes_per_sec as f64 / (1024.0 * 1024.0);
+                    
+                    Ok(StorageMetrics {
+                        read_throughput_mb_per_s,
+                        write_throughput_mb_per_s,
+                        queue_depth,
+                        latency_ms: None, // Would require additional performance counter
+                    })
+                } else {
+                    // No performance data found, return zeros
+                    log::debug!("No disk performance data found in WMI query result");
+                    Ok(StorageMetrics {
+                        read_throughput_mb_per_s: 0.0,
+                        write_throughput_mb_per_s: 0.0,
+                        queue_depth: None,
+                        latency_ms: None,
+                    })
+                }
+            }
+            Err(e) => {
+                log::warn!("WMI storage performance query failed: {}, returning zero metrics", e);
+                // Return zero metrics on error
+                Ok(StorageMetrics {
+                    read_throughput_mb_per_s: 0.0,
+                    write_throughput_mb_per_s: 0.0,
+                    queue_depth: None,
+                    latency_ms: None,
+                })
+            }
         }
-        
-        let output_str = String::from_utf8_lossy(&output.stdout);
-        
-        // Parse typeperf output (CSV format)
-        // Format: "(PDH-CSV 4.0)","\\ComputerName\\PhysicalDisk(_Total)\\Disk Read Bytes/sec","\\ComputerName\\PhysicalDisk(_Total)\\Disk Write Bytes/sec","\\ComputerName\\PhysicalDisk(_Total)\\Avg. Disk Queue Length"
-        // "10/15/2024 12:00:00.000","1234.567","890.123","1.234"
-        
-        let lines: Vec<&str> = output_str.lines().collect();
-        if lines.len() < 3 {
-            return Ok(StorageMetrics {
-                read_throughput_mb_per_s: 0.0,
-                write_throughput_mb_per_s: 0.0,
-                queue_depth: None,
-                latency_ms: None,
-            });
-        }
-        
-        // Get the data line (usually line 2, after header)
-        let data_line = lines.get(2).unwrap_or(&"");
-        
-        // Parse CSV values (remove quotes)
-        let values: Vec<&str> = data_line.split(',').collect();
-        if values.len() < 4 {
-            return Ok(StorageMetrics {
-                read_throughput_mb_per_s: 0.0,
-                write_throughput_mb_per_s: 0.0,
-                queue_depth: None,
-                latency_ms: None,
-            });
-        }
-        
-        // Parse values (remove quotes and parse)
-        let read_bytes_per_sec = values.get(1)
-            .and_then(|s| s.trim_matches('"').parse::<f64>().ok())
-            .unwrap_or(0.0);
-        let write_bytes_per_sec = values.get(2)
-            .and_then(|s| s.trim_matches('"').parse::<f64>().ok())
-            .unwrap_or(0.0);
-        let queue_depth = values.get(3)
-            .and_then(|s| s.trim_matches('"').parse::<f64>().ok())
-            .map(|q| q as u32);
-        
-        // Convert bytes/sec to MB/sec
-        let read_throughput_mb_per_s = read_bytes_per_sec / (1024.0 * 1024.0);
-        let write_throughput_mb_per_s = write_bytes_per_sec / (1024.0 * 1024.0);
-        
-        Ok(StorageMetrics {
-            read_throughput_mb_per_s,
-            write_throughput_mb_per_s,
-            queue_depth,
-            latency_ms: None, // Would require additional performance counter
-        })
     }
 }
 

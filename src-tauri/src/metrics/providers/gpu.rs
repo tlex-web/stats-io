@@ -87,11 +87,18 @@ mod windows {
     
     /// Get NVIDIA GPU metrics using nvidia-smi
     async fn get_nvidia_metrics() -> Result<GpuMetrics, MetricsError> {
-        let output = tokio::process::Command::new("nvidia-smi")
-            .args(&[
-                "--query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu,clocks.current.graphics,clocks.current.memory,power.draw",
-                "--format=csv,noheader,nounits",
-            ])
+        // Use CREATE_NO_WINDOW flag to prevent console window from appearing
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        
+        let mut cmd = tokio::process::Command::new("nvidia-smi");
+        cmd.args(&[
+            "--query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu,clocks.current.graphics,clocks.current.memory,power.draw",
+            "--format=csv,noheader,nounits",
+        ])
+        .creation_flags(CREATE_NO_WINDOW);
+        
+        let output = cmd
             .output()
             .await
             .map_err(|e| MetricsError::CollectionFailed(format!("nvidia-smi failed: {}", e)))?;
@@ -134,8 +141,69 @@ mod windows {
     
     /// Get basic GPU metrics using WMI (fallback)
     async fn get_wmi_gpu_metrics() -> Result<GpuMetrics, MetricsError> {
-        // WMI doesn't provide real-time metrics, so we return basic structure
-        // with utilization set to 0 (indicating metrics unavailable)
+        use wmi::WMIConnection;
+        
+        // Try to get GPU info from WMI
+        let wmi_con = WMIConnection::new()
+            .map_err(|e| MetricsError::CollectionFailed(format!("WMI connection failed: {}", e)))?;
+        
+        // Query Win32_VideoController for GPU information
+        let query = "SELECT * FROM Win32_VideoController WHERE AdapterRAM IS NOT NULL";
+        let results: Result<Vec<serde_json::Value>, _> = wmi_con.raw_query(query);
+        
+        match results {
+            Ok(controllers) => {
+                // Find the first non-basic display adapter
+                for controller in controllers {
+                    let name = controller.get("Name")
+                        .or_else(|| controller.get("name"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    
+                    let name_upper = name.to_uppercase();
+                    // Skip basic display adapters
+                    if name_upper.contains("MICROSOFT") || 
+                       name_upper.contains("BASIC DISPLAY") ||
+                       name_upper.contains("REMOTE") {
+                        continue;
+                    }
+                    
+                    // Get VRAM (AdapterRAM is in bytes)
+                    let vram_total_mb = controller.get("AdapterRAM")
+                        .or_else(|| controller.get("adapterRAM"))
+                        .and_then(|v| {
+                            v.as_u64()
+                                .or_else(|| v.as_i64().map(|x| x as u64))
+                                .map(|bytes| {
+                                    if bytes > 0 && bytes < u64::MAX / 2 {
+                                        bytes / (1024 * 1024)
+                                    } else {
+                                        0
+                                    }
+                                })
+                        })
+                        .filter(|&mb| mb > 0);
+                    
+                    // WMI doesn't provide real-time utilization, temperature, etc.
+                    // But we can return the VRAM info we have
+                    return Ok(GpuMetrics {
+                        utilization: 0.0, // Not available from WMI
+                        vram_used_mb: None, // Not available from WMI
+                        vram_total_mb,
+                        temperature: None, // Not available from WMI
+                        clock_core_mhz: None, // Not available from WMI
+                        clock_memory_mhz: None, // Not available from WMI
+                        power_watts: None, // Not available from WMI
+                    });
+                }
+            }
+            Err(e) => {
+                log::warn!("WMI GPU metrics query failed: {}", e);
+            }
+        }
+        
+        // If no GPU found or query failed, return zero metrics
         Ok(GpuMetrics {
             utilization: 0.0,
             vram_used_mb: None,
@@ -177,6 +245,7 @@ mod linux {
     
     async fn get_nvidia_metrics() -> Result<GpuMetrics, MetricsError> {
         // Same implementation as Windows
+        // Note: On Linux, nvidia-smi doesn't spawn visible windows, but we keep it consistent
         let output = tokio::process::Command::new("nvidia-smi")
             .args(&[
                 "--query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu,clocks.current.graphics,clocks.current.memory,power.draw",

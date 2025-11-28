@@ -53,43 +53,42 @@ impl CpuMetricsProvider for SysInfoCpuMetricsProvider {
 /// Get CPU temperature using platform-specific APIs
 #[cfg(target_os = "windows")]
 async fn get_cpu_temperature() -> Option<f64> {
-        // Try WMI query for CPU temperature
-        // Use wmic to query MSAcpi_ThermalZoneTemperature or Win32_TemperatureProbe
-        let output = tokio::process::Command::new("wmic")
-            .args(&[
-                "path",
-                "MSAcpi_ThermalZoneTemperature",
-                "get",
-                "CurrentTemperature",
-                "/format:csv",
-            ])
-            .output()
-            .await
-            .ok()?;
+        // Use WMI COM interface directly - no process spawning, no windows
+        use wmi::WMIConnection;
         
-        if !output.status.success() {
-            return None;
+        let wmi_con = WMIConnection::new().ok()?;
+        
+        // Try MSAcpi_ThermalZoneTemperature first (more accurate)
+        let query = "SELECT CurrentTemperature FROM MSAcpi_ThermalZoneTemperature";
+        if let Ok(results) = wmi_con.raw_query::<serde_json::Value>(query) {
+            for temp_obj in results {
+                if let Some(temp_value) = temp_obj.get("CurrentTemperature") {
+                    if let Some(temp_kelvin_10th) = temp_value.as_u64() {
+                        // Convert from tenths of Kelvin to Celsius
+                        let temp_kelvin = temp_kelvin_10th as f64 / 10.0;
+                        let temp_celsius = temp_kelvin - 273.15;
+                        
+                        // Sanity check: CPU temps should be between 0-150°C
+                        if temp_celsius >= 0.0 && temp_celsius <= 150.0 {
+                            return Some(temp_celsius);
+                        }
+                    }
+                }
+            }
         }
         
-        let output_str = String::from_utf8_lossy(&output.stdout);
-        
-        // Parse CSV output: Node,CurrentTemperature
-        // Temperature is in tenths of Kelvin, convert to Celsius
-        for line in output_str.lines().skip(1) {
-            if line.trim().is_empty() || line.starts_with("Node,") {
-                continue;
-            }
-            
-            let fields: Vec<&str> = line.split(',').collect();
-            if let Some(temp_str) = fields.get(1) {
-                if let Ok(temp_kelvin_10th) = temp_str.trim().parse::<u32>() {
-                    // Convert from tenths of Kelvin to Celsius
-                    let temp_kelvin = temp_kelvin_10th as f64 / 10.0;
-                    let temp_celsius = temp_kelvin - 273.15;
-                    
-                    // Sanity check: CPU temps should be between 0-150°C
-                    if temp_celsius >= 0.0 && temp_celsius <= 150.0 {
-                        return Some(temp_celsius);
+        // Fallback to Win32_TemperatureProbe
+        let query = "SELECT CurrentReading FROM Win32_TemperatureProbe WHERE Description LIKE '%CPU%'";
+        if let Ok(results) = wmi_con.raw_query::<serde_json::Value>(query) {
+            for temp_obj in results {
+                if let Some(temp_value) = temp_obj.get("CurrentReading") {
+                    if let Some(temp_tenths_celsius) = temp_value.as_u64() {
+                        let temp_celsius = temp_tenths_celsius as f64 / 10.0;
+                        
+                        // Sanity check: CPU temps should be between 0-150°C
+                        if temp_celsius >= 0.0 && temp_celsius <= 150.0 {
+                            return Some(temp_celsius);
+                        }
                     }
                 }
             }

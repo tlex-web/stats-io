@@ -13,6 +13,9 @@ use sysinfo::System;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+#[cfg(target_os = "windows")]
+use wmi::WMIConnection;
+
 /// Windows hardware detector implementation
 pub struct WindowsHardwareDetector {
     system: Arc<Mutex<System>>,
@@ -72,84 +75,110 @@ impl WindowsHardwareDetector {
         })
     }
     
-    /// Detect GPU information using WMI
+    /// Detect GPU information using direct WMI COM interface (no process spawning)
     async fn detect_gpus(&self) -> Result<Vec<GPUInfo>, HardwareError> {
         let mut gpus = Vec::new();
         
-        // Use wmic command to query Win32_VideoController
-        // This is simpler than COM WMI for MVP and works reliably
-        let output = tokio::process::Command::new("wmic")
-            .args(&[
-                "path",
-                "win32_VideoController",
-                "get",
-                "Name,AdapterRAM,DriverVersion,PNPDeviceID",
-                "/format:csv",
-            ])
-            .output()
-            .await
-            .map_err(|e| HardwareError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("Failed to execute wmic: {}", e)
-            )))?;
+        // Use WMI COM interface directly - no process spawning, no windows
+        let wmi_con = match WMIConnection::new() {
+            Ok(con) => con,
+            Err(e) => {
+                log::error!("Failed to connect to WMI for GPU detection: {}", e);
+                return Ok(gpus); // Return empty list on connection failure
+            }
+        };
         
-        if !output.status.success() {
-            // If wmic fails, return empty vector (graceful degradation)
-            return Ok(gpus);
+        // Query Win32_VideoController using WMI
+        // Note: Property names in WMI are case-sensitive
+        let query = "SELECT Name, AdapterRAM, DriverVersion, PNPDeviceID FROM Win32_VideoController";
+        let results: Result<Vec<serde_json::Value>, _> = wmi_con.raw_query(query);
+        
+        match results {
+            Ok(video_controllers) => {
+                log::debug!("Found {} video controllers via WMI", video_controllers.len());
+                
+                for controller in video_controllers {
+                    // WMI returns properties in various formats, try different access methods
+                    let name = controller.get("Name")
+                        .or_else(|| controller.get("name"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    
+                    if name.is_empty() {
+                        log::debug!("Skipping GPU with empty name");
+                        continue;
+                    }
+                    
+                    // Skip basic display adapters and virtual GPUs
+                    let name_upper = name.to_uppercase();
+                    if name_upper.contains("MICROSOFT") || 
+                       name_upper.contains("BASIC DISPLAY") ||
+                       name_upper.contains("REMOTE DESKTOP") ||
+                       name_upper.contains("VIRTUAL") {
+                        log::debug!("Skipping virtual/basic GPU: {}", name);
+                        continue;
+                    }
+                    
+                    // Parse AdapterRAM (in bytes, convert to MB)
+                    // AdapterRAM can be null for some GPUs, or might be a string
+                    let vram_mb = controller.get("AdapterRAM")
+                        .or_else(|| controller.get("adapterRAM"))
+                        .and_then(|v| {
+                            // Try as u64 first
+                            v.as_u64()
+                                .or_else(|| {
+                                    // Try as string and parse
+                                    v.as_str()
+                                        .and_then(|s| s.parse::<u64>().ok())
+                                })
+                        })
+                        .map(|bytes| {
+                            // Convert bytes to MB
+                            bytes / (1024 * 1024)
+                        });
+                    
+                    let driver_version = controller.get("DriverVersion")
+                        .or_else(|| controller.get("driverVersion"))
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .filter(|s| !s.is_empty());
+                    
+                    let pci_id = controller.get("PNPDeviceID")
+                        .or_else(|| controller.get("pnpDeviceID"))
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .filter(|s| !s.is_empty());
+                    
+                    // Determine vendor from name
+                    let vendor = if name_upper.contains("NVIDIA") {
+                        "NVIDIA".to_string()
+                    } else if name_upper.contains("AMD") || name_upper.contains("RADEON") {
+                        "AMD".to_string()
+                    } else if name_upper.contains("INTEL") {
+                        "Intel".to_string()
+                    } else {
+                        "Unknown".to_string()
+                    };
+                    
+                    log::info!("Detected GPU: {} ({}), VRAM: {:?} MB", name, vendor, vram_mb);
+                    
+                    gpus.push(GPUInfo {
+                        model: name,
+                        vendor,
+                        vram_total_mb: vram_mb,
+                        driver_version,
+                        pci_id,
+                    });
+                }
+            }
+            Err(e) => {
+                log::error!("WMI GPU query failed: {}", e);
+            }
         }
         
-        let output_str = String::from_utf8_lossy(&output.stdout);
-        
-        // Parse CSV output from wmic
-        // Format: Node,Name,AdapterRAM,DriverVersion,PNPDeviceID
-        let lines: Vec<&str> = output_str.lines().collect();
-        
-        for line in lines.iter().skip(1) { // Skip header
-            if line.trim().is_empty() || line.starts_with("Node,") {
-                continue;
-            }
-            
-            let fields: Vec<&str> = line.split(',').collect();
-            if fields.len() < 5 {
-                continue;
-            }
-            
-            let name = fields.get(1).unwrap_or(&"").trim();
-            if name.is_empty() || name == "Name" {
-                continue;
-            }
-            
-            // Parse AdapterRAM (in bytes, convert to MB)
-            let vram_mb = fields.get(2)
-                .and_then(|s| s.trim().parse::<u64>().ok())
-                .map(|bytes| bytes / (1024 * 1024));
-            
-            let driver_version = fields.get(3)
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty());
-            
-            let pci_id = fields.get(4)
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty());
-            
-            // Determine vendor from name
-            let vendor = if name.to_uppercase().contains("NVIDIA") {
-                "NVIDIA".to_string()
-            } else if name.to_uppercase().contains("AMD") || name.to_uppercase().contains("RADEON") {
-                "AMD".to_string()
-            } else if name.to_uppercase().contains("INTEL") {
-                "Intel".to_string()
-            } else {
-                "Unknown".to_string()
-            };
-            
-            gpus.push(GPUInfo {
-                model: name.to_string(),
-                vendor,
-                vram_total_mb: vram_mb,
-                driver_version,
-                pci_id,
-            });
+        if gpus.is_empty() {
+            log::warn!("No GPUs detected via WMI");
         }
         
         Ok(gpus)
@@ -177,88 +206,107 @@ impl WindowsHardwareDetector {
         })
     }
     
-    /// Detect storage devices using WMI
+    /// Detect storage devices using direct WMI COM interface (no process spawning)
     async fn detect_storage(&self) -> Result<Vec<StorageInfo>, HardwareError> {
         let mut storage_devices = Vec::new();
         
-        // Use wmic to query Win32_DiskDrive for physical disks
-        let output = tokio::process::Command::new("wmic")
-            .args(&[
-                "path",
-                "win32_DiskDrive",
-                "get",
-                "Model,Size,InterfaceType,MediaType",
-                "/format:csv",
-            ])
-            .output()
-            .await
-            .map_err(|e| HardwareError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("Failed to execute wmic: {}", e)
-            )))?;
+        // Use WMI COM interface directly - no process spawning, no windows
+        let wmi_con = match WMIConnection::new() {
+            Ok(con) => con,
+            Err(e) => {
+                log::error!("Failed to connect to WMI for storage detection: {}", e);
+                return Ok(storage_devices); // Return empty list on connection failure
+            }
+        };
         
-        if !output.status.success() {
-            // If wmic fails, try to use sysinfo as fallback
-            return Self::detect_storage_sysinfo().await;
+        // Query Win32_DiskDrive using WMI
+        // Note: Property names in WMI are case-sensitive
+        let query = "SELECT Model, Size, InterfaceType, MediaType FROM Win32_DiskDrive";
+        let results: Result<Vec<serde_json::Value>, _> = wmi_con.raw_query(query);
+        
+        match results {
+            Ok(disk_drives) => {
+                log::debug!("Found {} disk drives via WMI", disk_drives.len());
+                
+                for drive in disk_drives {
+                    // WMI returns properties in various formats, try different access methods
+                    let model = drive.get("Model")
+                        .or_else(|| drive.get("model"))
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.trim().to_string())
+                        .unwrap_or_default();
+                    
+                    if model.is_empty() {
+                        log::debug!("Skipping storage device with empty model");
+                        continue;
+                    }
+                    
+                    // Parse Size (in bytes, convert to MB)
+                    // Size can be null for some drives, or might be a string
+                    let capacity_mb = drive.get("Size")
+                        .or_else(|| drive.get("size"))
+                        .and_then(|v| {
+                            // Try as u64 first
+                            v.as_u64()
+                                .or_else(|| {
+                                    // Try as string and parse
+                                    v.as_str()
+                                        .and_then(|s| s.parse::<u64>().ok())
+                                })
+                        })
+                        .map(|bytes| bytes / (1024 * 1024))
+                        .unwrap_or(0);
+                    
+                    let interface = drive.get("InterfaceType")
+                        .or_else(|| drive.get("interfaceType"))
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty());
+                    
+                    let media_type = drive.get("MediaType")
+                        .or_else(|| drive.get("mediaType"))
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.trim().to_lowercase())
+                        .unwrap_or_default();
+                    
+                    // Determine storage type from interface and media type
+                    let model_upper = model.to_uppercase();
+                    let interface_upper = interface.as_ref().map(|s| s.to_uppercase());
+                    
+                    let storage_type = if model_upper.contains("NVME") || 
+                                         interface_upper.as_ref().map(|s| s.contains("NVME")).unwrap_or(false) {
+                        StorageType::NVMe
+                    } else if media_type.contains("ssd") || 
+                              model_upper.contains("SSD") ||
+                              interface_upper.as_ref().map(|s| s.contains("SATA")).unwrap_or(false) {
+                        StorageType::SSD
+                    } else if media_type.contains("hdd") || 
+                              model_upper.contains("HDD") ||
+                              media_type.contains("fixed") ||
+                              media_type.contains("disk") {
+                        StorageType::HDD
+                    } else {
+                        StorageType::Unknown
+                    };
+                    
+                    log::info!("Detected storage: {} ({}), Capacity: {} MB, Type: {:?}", 
+                        model, interface.as_ref().unwrap_or(&"Unknown".to_string()), capacity_mb, storage_type);
+                    
+                    storage_devices.push(StorageInfo {
+                        model,
+                        capacity_mb,
+                        storage_type,
+                        interface,
+                    });
+                }
+            }
+            Err(e) => {
+                log::error!("WMI storage query failed: {}", e);
+            }
         }
         
-        let output_str = String::from_utf8_lossy(&output.stdout);
-        let lines: Vec<&str> = output_str.lines().collect();
-        
-        for line in lines.iter().skip(1) { // Skip header
-            if line.trim().is_empty() || line.starts_with("Node,") {
-                continue;
-            }
-            
-            let fields: Vec<&str> = line.split(',').collect();
-            if fields.len() < 5 {
-                continue;
-            }
-            
-            let model = fields.get(1).unwrap_or(&"").trim();
-            if model.is_empty() || model == "Model" {
-                continue;
-            }
-            
-            // Parse Size (in bytes, convert to MB)
-            let capacity_mb = fields.get(2)
-                .and_then(|s| s.trim().parse::<u64>().ok())
-                .map(|bytes| bytes / (1024 * 1024))
-                .unwrap_or(0);
-            
-            let interface = fields.get(3).map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty());
-            
-            let media_type = fields.get(4).map(|s| s.trim().to_lowercase())
-                .unwrap_or_default();
-            
-            // Determine storage type from interface and media type
-            let storage_type = if model.to_uppercase().contains("NVME") || 
-                                 interface.as_ref().map(|s| s.to_uppercase().contains("NVME")).unwrap_or(false) {
-                StorageType::NVMe
-            } else if media_type.contains("ssd") || 
-                      model.to_uppercase().contains("SSD") ||
-                      interface.as_ref().map(|s| s.to_uppercase().contains("SATA")).unwrap_or(false) {
-                StorageType::SSD
-            } else if media_type.contains("hdd") || 
-                      model.to_uppercase().contains("HDD") ||
-                      media_type.contains("fixed") {
-                StorageType::HDD
-            } else {
-                StorageType::Unknown
-            };
-            
-            storage_devices.push(StorageInfo {
-                model: model.to_string(),
-                capacity_mb,
-                storage_type,
-                interface,
-            });
-        }
-        
-        // If no devices found, try sysinfo fallback
         if storage_devices.is_empty() {
-            return Self::detect_storage_sysinfo().await;
+            log::warn!("No storage devices detected via WMI");
         }
         
         Ok(storage_devices)
@@ -310,20 +358,55 @@ impl HardwareDetector for WindowsHardwareDetector {
             system.refresh_all();
         }
         
-        // Detect all components
-        let cpu = self.detect_cpu().await?;
-        let gpus = self.detect_gpus().await?;
-        let memory = self.detect_memory().await?;
-        let storage_devices = self.detect_storage().await?;
-        let motherboard = self.detect_motherboard().await?;
-        let psu = self.detect_psu().await?;
-        let cooling = self.detect_cooling().await?;
-        let displays = self.detect_displays().await?;
+        // Detect all components - allow partial failures
+        let cpu = self.detect_cpu().await?; // CPU detection must succeed
+        let memory = self.detect_memory().await?; // Memory detection must succeed
+        
+        // GPU and storage detection can fail gracefully
+        let gpus = self.detect_gpus().await.unwrap_or_else(|e| {
+            log::warn!("GPU detection failed: {}, continuing with empty GPU list", e);
+            Vec::new()
+        });
+        
+        let storage_devices = self.detect_storage().await.unwrap_or_else(|e| {
+            log::warn!("Storage detection failed: {}, continuing with empty storage list", e);
+            Vec::new()
+        });
+        
+        // Optional components
+        let motherboard = self.detect_motherboard().await.unwrap_or_else(|e| {
+            log::warn!("Motherboard detection failed: {}", e);
+            None
+        });
+        
+        let psu = self.detect_psu().await.unwrap_or_else(|e| {
+            log::warn!("PSU detection failed: {}", e);
+            None
+        });
+        
+        let cooling = self.detect_cooling().await.unwrap_or_else(|e| {
+            log::warn!("Cooling detection failed: {}", e);
+            None
+        });
+        
+        let displays = self.detect_displays().await.unwrap_or_else(|e| {
+            log::warn!("Display detection failed: {}", e);
+            Vec::new()
+        });
+        
+        // Collect warnings for missing components
+        let mut warnings = Vec::new();
+        if gpus.is_empty() {
+            warnings.push("No GPUs detected. GPU detection may have failed.".to_string());
+        }
+        if storage_devices.is_empty() {
+            warnings.push("No storage devices detected. Storage detection may have failed.".to_string());
+        }
         
         let metadata = DetectionMetadata {
             detection_time: chrono::Utc::now(),
             platform: "windows".to_string(),
-            warnings: Vec::new(), // Can be populated with detection warnings
+            warnings,
             schema_version: 1,
         };
         
@@ -357,3 +440,6 @@ impl Default for WindowsHardwareDetector {
         Self::new()
     }
 }
+
+
+
